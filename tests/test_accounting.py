@@ -75,20 +75,6 @@ def _to_date(raw: dict[str, float]) -> dict[date, float]:
     return {date.fromisoformat(k): v for k, v in raw.items()}
 
 
-@pytest.fixture()
-def client(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
-
-    from app.config import Settings
-    from app.main import create_app
-
-    db_path = tmp_path / "test.db"
-    monkeypatch.setenv("LIGHTS_DB_PATH", str(db_path))
-    app = create_app(Settings(db_path=str(db_path)))
-    with TestClient(app) as c:
-        yield c
-
-
 def test_issue_report_uses_7_day_windows_controls_and_net_savings(client):
     ids = seed(client)
     resp = client.post("/api/reports", params={"segment_id": ids["T-目标"]})
@@ -286,18 +272,12 @@ def test_correction_only_rereads_corrected_segment(client, monkeypatch):
 
     calls: list[int] = []
     original_for_dates = service._readings_for_dates
-    original_all = service._all_readings
 
     def spy_for_dates(conn, segment_id, dates):
         calls.append(segment_id)
         return original_for_dates(conn, segment_id, dates)
 
-    def spy_all(conn, segment_id):
-        calls.append(segment_id)
-        return original_all(conn, segment_id)
-
     monkeypatch.setattr(service, "_readings_for_dates", spy_for_dates)
-    monkeypatch.setattr(service, "_all_readings", spy_all)
 
     client.put(
         f"/api/segments/{ids['C1-对照']}/readings",

@@ -6,7 +6,13 @@ Design notes
   7 calendar days after it.  The retrofit day itself is skipped.
 * A segment is control-eligible for a window when it has no retrofit date yet or
   its retrofit date lies after the last day of the after-window, and it has a
-  reading on every one of the 14 window days.
+  daily reading on every one of the 14 window days.
+* Control screening uses the pre-maintained ``reading_coverage`` index: one
+  batched query per issuance over the window dates, never the readings table and
+  never one query per candidate segment.  Only the segments that pass screening
+  have their consumption values read for the arithmetic.  The coverage index is
+  updated by triggers in the same transaction as the reading write, so coverage
+  and values always describe the same committed state.
 * Savings are ``(target before average - target after average) -
   mean(control before average - control after average)`` in kWh per lamp per
   day.
@@ -17,9 +23,11 @@ Design notes
   generation and corrections are serialised by SQLite.  A correction therefore
   either sees the new report and marks it, or commits before the report is
   snapshotted.  It can never fall between the snapshot read and the insert.
-* Correction impact is evaluated by re-reading only the corrected segment's
-  daily readings.  Other segments are never re-read; the report snapshot tells
-  us which of those readings the report actually used.
+* Correction impact is evaluated from the correction's own change set (the
+  values submitted with an upsert, the deleted date, or the retrofit date
+  change) plus the coverage index.  A correction never rescans the segment's
+  historical daily readings; the report snapshot tells us which reading days
+  the report actually used.
 """
 
 from __future__ import annotations
@@ -96,6 +104,17 @@ def _average(values: Iterable[float]) -> float:
     return round(sum(values) / len(values), 6)
 
 
+#: Keep each ``IN (...)`` under the classic SQLite 999 bound-variable limit
+#: (older builds still default to it), so large upserts or many report windows
+#: cannot overflow a single statement.
+_MAX_BOUND_VARIABLES = 900
+
+
+def _chunks(items: list, size: int) -> Iterable[list]:
+    for offset in range(0, len(items), size):
+        yield items[offset : offset + size]
+
+
 def _window_averages(
     readings: dict[date, float], window: dict[str, date]
 ) -> tuple[float, float, float]:
@@ -135,24 +154,117 @@ def _readings_for_dates(
     conn: sqlite3.Connection, segment_id: int, dates: Iterable[date]
 ) -> dict[date, float]:
     dates = sorted(set(dates))
-    if not dates:
-        return {}
-    placeholders = ",".join("?" for _ in dates)
-    rows = conn.execute(
-        f"SELECT reading_date, kwh_per_lamp FROM readings "
-        f"WHERE segment_id = ? AND reading_date IN ({placeholders})",
-        (segment_id, *[d.isoformat() for d in dates]),
-    ).fetchall()
-    return {date.fromisoformat(r["reading_date"]): r["kwh_per_lamp"] for r in rows}
+    result: dict[date, float] = {}
+    for chunk in _chunks(dates, _MAX_BOUND_VARIABLES - 1):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT reading_date, kwh_per_lamp FROM readings "
+            f"WHERE segment_id = ? AND reading_date IN ({placeholders})",
+            (segment_id, *[d.isoformat() for d in chunk]),
+        ).fetchall()
+        result.update(
+            {date.fromisoformat(r["reading_date"]): r["kwh_per_lamp"] for r in rows}
+        )
+    return result
 
 
-def _all_readings(conn: sqlite3.Connection, segment_id: int) -> dict[date, float]:
-    rows = conn.execute(
-        "SELECT reading_date, kwh_per_lamp FROM readings WHERE segment_id = ? "
-        "ORDER BY reading_date",
-        (segment_id,),
-    ).fetchall()
-    return {date.fromisoformat(r["reading_date"]): r["kwh_per_lamp"] for r in rows}
+def _readings_for_segments(
+    conn: sqlite3.Connection, segment_ids: Iterable[int], dates: Iterable[date]
+) -> dict[int, dict[date, float]]:
+    """Read the window values of the screened-in controls in one query.
+
+    This only runs for segments that already passed coverage screening, and
+    only for the comparison dates; unselected candidates are never read.
+    """
+
+    segment_ids = sorted(set(segment_ids))
+    dates = sorted(set(dates))
+    result: dict[int, dict[date, float]] = {segment_id: {} for segment_id in segment_ids}
+    if not segment_ids or not dates:
+        return result
+    # One statement per segment chunk covers all comparison dates; a typical
+    # control list fits in a single query.
+    date_placeholders = ",".join("?" for _ in dates)
+    segment_chunk_size = max(1, _MAX_BOUND_VARIABLES - len(dates))
+    for chunk in _chunks(segment_ids, segment_chunk_size):
+        segment_placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT segment_id, reading_date, kwh_per_lamp FROM readings "
+            f"WHERE segment_id IN ({segment_placeholders}) "
+            f"AND reading_date IN ({date_placeholders})",
+            (*chunk, *[d.isoformat() for d in dates]),
+        ).fetchall()
+        for row in rows:
+            result[row["segment_id"]][date.fromisoformat(row["reading_date"])] = row[
+                "kwh_per_lamp"
+            ]
+    return result
+
+
+def _covered_dates(
+    conn: sqlite3.Connection, segment_id: int, dates: Iterable[date]
+) -> set[date]:
+    """Which of ``dates`` already have a daily report, from the coverage index.
+
+    Only the coverage index is touched; the readings table is not read.
+    """
+
+    dates = sorted(set(dates))
+    covered: set[date] = set()
+    for chunk in _chunks(dates, _MAX_BOUND_VARIABLES - 1):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT reading_date FROM reading_coverage "
+            f"WHERE segment_id = ? AND reading_date IN ({placeholders})",
+            (segment_id, *[d.isoformat() for d in chunk]),
+        ).fetchall()
+        covered.update(date.fromisoformat(row["reading_date"]) for row in rows)
+    return covered
+
+
+def _screen_control_segments(
+    conn: sqlite3.Connection, target_segment_id: int, window: dict[str, date]
+) -> list[sqlite3.Row]:
+    """Batch-screen control eligibility using only the coverage index.
+
+    One query covers every candidate: date eligibility is applied in the
+    segments table and completeness by counting covered window days.  The
+    readings table is never consulted here, so candidates that are not used
+    have their consumption values never read.
+    """
+
+    dates = window_dates(window)
+    # 14 window days fit in one statement; if a wider window ever needed
+    # chunking, a segment must have full coverage of every chunk, so intersect
+    # the per-chunk candidate sets.  Screening stays batched either way.
+    candidates: set[int] | None = None
+    rows_by_id: dict[int, sqlite3.Row] = {}
+    for chunk in _chunks(dates, _MAX_BOUND_VARIABLES - 2):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT s.id, s.name, s.retrofit_date, "
+            f"       COUNT(c.reading_date) AS covered_days "
+            f"FROM segments s "
+            f"JOIN reading_coverage c ON c.segment_id = s.id "
+            f"WHERE s.id <> ? "
+            f"  AND (s.retrofit_date IS NULL OR s.retrofit_date > ?) "
+            f"  AND c.reading_date IN ({placeholders}) "
+            f"GROUP BY s.id "
+            f"HAVING covered_days = ?",
+            (
+                target_segment_id,
+                window["after_end"].isoformat(),
+                *[d.isoformat() for d in chunk],
+                len(chunk),
+            ),
+        ).fetchall()
+        chunk_ids = {row["id"] for row in rows}
+        candidates = chunk_ids if candidates is None else candidates & chunk_ids
+        rows_by_id.update({row["id"]: row for row in rows})
+    return sorted(
+        (rows_by_id[sid] for sid in candidates or set()),
+        key=lambda row: (row["name"], row["id"]),
+    )
 
 
 def _is_control_eligible(retrofit_date: date | None, after_end: date) -> bool:
@@ -265,56 +377,50 @@ def upsert_readings(
 ) -> CorrectionResult:
     """Insert/overwrite daily readings and mark affected reports stale.
 
-    Only this segment's readings are (re-)read for impact analysis.
+    Only the submitted days are compared; the segment's other historical
+    readings are never re-read or rescanned.  The coverage index is updated by
+    triggers in this same transaction.
     """
 
     with db.write() as conn:
         row = _get_segment_row(conn, segment_id)
-        old = _all_readings(conn, segment_id)
         # Later entries win for a duplicated date, matching the upsert order.
         latest: dict[date, float] = {}
         for reading_date, value in readings:
             latest[reading_date] = value
-        changed_dates: list[date] = []
-        now = utcnow_iso()
-        for reading_date, value in latest.items():
-            if reading_date not in old or old[reading_date] != value:
-                changed_dates.append(reading_date)
+        # Read back only the days being submitted (needed for no-op detection
+        # and for the correction impact); never the historical backlog.
+        existing = _readings_for_dates(conn, segment_id, latest)
+        changed_dates = sorted(
+            d for d, value in latest.items() if existing.get(d) != value
+        )
+        retrofit = (
+            date.fromisoformat(row["retrofit_date"]) if row["retrofit_date"] else None
+        )
 
         if not changed_dates:
             return CorrectionResult(
                 segment_id=segment_id,
                 changed=False,
-                old_retrofit_date=(
-                    date.fromisoformat(row["retrofit_date"])
-                    if row["retrofit_date"]
-                    else None
-                ),
-                new_retrofit_date=(
-                    date.fromisoformat(row["retrofit_date"])
-                    if row["retrofit_date"]
-                    else None
-                ),
+                old_retrofit_date=retrofit,
+                new_retrofit_date=retrofit,
                 impact=_impact_metrics(conn, segment_id, affected=[]),
             ).model_dump()
 
-        for reading_date, value in latest.items():
+        now = utcnow_iso()
+        for reading_date in changed_dates:
             conn.execute(
                 "INSERT INTO readings (segment_id, reading_date, kwh_per_lamp, updated_at) "
                 "VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(segment_id, reading_date) DO UPDATE SET "
                 "kwh_per_lamp = excluded.kwh_per_lamp, updated_at = excluded.updated_at",
-                (segment_id, reading_date.isoformat(), value, now),
+                (segment_id, reading_date.isoformat(), latest[reading_date], now),
             )
         conn.execute(
             "UPDATE segments SET version = version + 1, updated_at = ? WHERE id = ?",
             (now, segment_id),
         )
 
-        retrofit = (
-            date.fromisoformat(row["retrofit_date"]) if row["retrofit_date"] else None
-        )
-        changed_dates_sorted = sorted(set(changed_dates))
         affected = _apply_correction_impact(
             conn,
             segment_id=segment_id,
@@ -322,12 +428,13 @@ def upsert_readings(
             retrofit_changed=False,
             old_retrofit=retrofit,
             new_retrofit=retrofit,
-            changed_dates=changed_dates_sorted,
+            changed_dates=changed_dates,
+            changed_values={d: latest[d] for d in changed_dates},
         )
         return CorrectionResult(
             segment_id=segment_id,
             changed=True,
-            changed_readings=changed_dates_sorted,
+            changed_readings=changed_dates,
             old_retrofit_date=retrofit,
             new_retrofit_date=retrofit,
             affected_reports=affected,
@@ -419,22 +526,34 @@ def _apply_correction_impact(
     old_retrofit: date | None,
     new_retrofit: date | None,
     changed_dates: list[date],
+    changed_values: dict[date, float] | None = None,
 ) -> list[AffectedReport]:
-    """Compare the corrected segment against report snapshots.
+    """Compare the correction's change set against report snapshots.
 
-    Reads only the corrected segment's readings.  Every impacted report is
-    marked ``pending_recalc`` inside the caller's write transaction.
+    Only the submitted/changed reading days are read (``changed_values`` lets
+    the caller pass the values it already read for the upsert), and only for
+    reports whose window actually used them.  Control completeness is checked
+    against the coverage index, not by scanning the segment's readings.  Every
+    impacted report is marked ``pending_recalc`` inside the caller's write
+    transaction.
     """
 
     reports = conn.execute("SELECT * FROM reports ORDER BY id").fetchall()
     if not reports:
         return []
 
-    # Gather only the dates the reports actually use, then read this segment once.
-    needed: set[date] = set()
+    changed = set(changed_dates)
+    # The correction's own values (tiny: one request's worth of days) and the
+    # coverage of every window day across all reports (index only).  Neither
+    # touches the segment's historical reading backlog.
+    if changed_values is None:
+        current = _readings_for_dates(conn, segment_id, changed) if changed else {}
+    else:
+        current = {d: v for d, v in changed_values.items() if d in changed}
+    all_window_dates: set[date] = set()
     for report in reports:
-        needed.update(window_dates(_window_from_row(report)))
-    current = _readings_for_dates(conn, segment_id, needed)
+        all_window_dates.update(window_dates(_window_from_row(report)))
+    covered = _covered_dates(conn, segment_id, all_window_dates)
 
     affected: list[AffectedReport] = []
     for report in reports:
@@ -458,7 +577,7 @@ def _apply_correction_impact(
                 diffs = [
                     d
                     for d in dates
-                    if str(d) in used and used[str(d)] != current.get(d)
+                    if d in changed and str(d) in used and used[str(d)] != current.get(d)
                 ]
                 if diffs:
                     reason = {
@@ -471,7 +590,7 @@ def _apply_correction_impact(
             controls = _snapshot_controls(snapshot)
             control = next((c for c in controls if c["id"] == segment_id), None)
             eligible = _is_control_eligible(new_retrofit, window["after_end"])
-            has_all = all(d in current for d in dates)
+            has_all = all(d in covered for d in dates)
 
             if control is not None:
                 if not eligible or not has_all:
@@ -489,7 +608,8 @@ def _apply_correction_impact(
                     diffs = [
                         d
                         for d in dates
-                        if control["readings"].get(str(d)) != current.get(d)
+                        if d in changed
+                        and control["readings"].get(str(d)) != current.get(d)
                     ]
                     if diffs:
                         reason = {
@@ -539,10 +659,6 @@ def _apply_correction_impact(
             )
         )
 
-    # Every diff above is derived from the snapshot vs. the re-read values, so
-    # stale marking relies only on this segment's readings, never on a
-    # caller-supplied change list and never on re-reading other segments.
-    _ = changed_dates
     return affected
 
 
@@ -599,16 +715,20 @@ def issue_report(
         target_values = _readings_for_dates(conn, segment_id, dates)
         missing = [d for d in dates if d not in target_values]
 
-        control_rows = conn.execute(
-            "SELECT * FROM segments WHERE id <> ? AND "
-            "(retrofit_date IS NULL OR retrofit_date > ?) ORDER BY name, id",
-            (segment_id, window["after_end"].isoformat()),
-        ).fetchall()
+        # Batch-screen every candidate with the pre-maintained coverage index
+        # (one query, readings table untouched), then read consumption values
+        # only for the segments that actually enter the report.
+        control_rows = _screen_control_segments(conn, segment_id, window)
+        control_values = _readings_for_segments(
+            conn, [row["id"] for row in control_rows], dates
+        )
 
         controls: list[dict] = []
         for row in control_rows:
-            values = _readings_for_dates(conn, row["id"], dates)
+            values = control_values.get(row["id"], {})
             if len(values) != len(dates):
+                # Coverage and values changed under us; a write is serialised
+                # by BEGIN IMMEDIATE, so this cannot happen in practice.
                 continue
             before_avg, after_avg, reduction = _window_averages(values, window)
             controls.append(

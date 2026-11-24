@@ -38,7 +38,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version=settings.app_version,
         description=(
             "Per-segment street-light retrofit savings, with control-segment "
-            "correction for concurrent electricity changes. Reports are "
+            "correction for concurrent electricity changes. Controls are screened "
+            "in batches from a pre-maintained daily-report coverage index; only "
+            "selected controls have their consumption values read. Reports are "
             "immutable snapshots; corrections mark impacted reports as "
             "`pending_recalc` while keeping the original results readable."
         ),
