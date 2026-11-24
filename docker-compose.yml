@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: streetlight-savings:local
+    ports:
+      - "8000:8000"
+    environment:
+      LIGHTS_DB_PATH: /data/lights.db
+    volumes:
+      - lights-data:/data
+    restart: unless-stopped
+
+volumes:
+  lights-data:
